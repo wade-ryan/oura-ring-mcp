@@ -2,6 +2,9 @@
  * Tests for MCP OAuth Server Provider (Oura Proxy)
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   OuraMcpOAuthProvider,
   type OuraMcpOAuthProviderOptions,
@@ -308,6 +311,42 @@ describe("OuraMcpOAuthProvider", () => {
       // 5. Verify our access token
       const authInfo = await provider.verifyAccessToken(tokens.access_token);
       expect(authInfo.clientId).toBe(client.client_id);
+    });
+
+    it("restores client, MCP tokens, and Oura token after a process restart", async () => {
+      const directory = mkdtempSync(join(tmpdir(), "oura-oauth-state-"));
+      const statePath = join(directory, "state.json");
+
+      try {
+        const firstOuraTokens = vi.fn();
+        const firstProvider = createProvider({
+          statePath,
+          onOuraTokens: firstOuraTokens,
+        });
+        const client = registerTestClient(firstProvider);
+        const code = await getAuthCodeViaOuraCallback(firstProvider, client);
+        const tokens = await firstProvider.exchangeAuthorizationCode(client, code);
+
+        const restoredOuraTokens = vi.fn();
+        const restoredProvider = createProvider({
+          statePath,
+          onOuraTokens: restoredOuraTokens,
+        });
+
+        expect(restoredProvider.clientsStore.getClient(client.client_id)).toBeDefined();
+        await expect(
+          restoredProvider.verifyAccessToken(tokens.access_token)
+        ).resolves.toMatchObject({ clientId: client.client_id });
+        await expect(
+          restoredProvider.exchangeRefreshToken(client, tokens.refresh_token!)
+        ).resolves.toMatchObject({ token_type: "bearer" });
+        expect(restoredOuraTokens).toHaveBeenCalledWith(
+          "oura-token",
+          "oura-refresh"
+        );
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
     });
   });
 

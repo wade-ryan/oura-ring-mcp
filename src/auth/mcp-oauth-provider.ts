@@ -21,6 +21,14 @@
  * bearer token (requires OURA_ACCESS_TOKEN env var for API calls).
  */
 import { randomUUID, randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname } from "node:path";
 import { Response } from "express";
 import type {
   OAuthServerProvider,
@@ -86,6 +94,21 @@ interface RefreshTokenEntry {
   scopes: string[];
 }
 
+interface OuraTokenEntry {
+  accessToken: string;
+  refreshToken: string;
+}
+
+interface PersistedOAuthState {
+  version: 1;
+  clients: Array<[string, OAuthClientInformationFull]>;
+  pendingAuths: Array<[string, PendingAuth]>;
+  authCodes: Array<[string, AuthCodeEntry]>;
+  accessTokens: Array<[string, TokenEntry]>;
+  refreshTokens: Array<[string, RefreshTokenEntry]>;
+  ouraTokens?: OuraTokenEntry;
+}
+
 const AUTH_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const ACCESS_TOKEN_TTL_S = 3600; // 1 hour
 
@@ -104,6 +127,8 @@ export interface OuraMcpOAuthProviderOptions {
   staticSecret?: string;
   /** Called when new Oura tokens are obtained via OAuth */
   onOuraTokens?: (accessToken: string, refreshToken: string) => void;
+  /** Optional JSON state file. Use a persistent disk path in hosted deployments. */
+  statePath?: string;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -122,6 +147,8 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
   private callbackUrl: string;
   private staticSecret: string | undefined;
   private onOuraTokens?: (accessToken: string, refreshToken: string) => void;
+  private statePath: string | undefined;
+  private ouraTokens: OuraTokenEntry | undefined;
 
   constructor(options: OuraMcpOAuthProviderOptions) {
     this.ouraClientId = options.ouraClientId;
@@ -129,6 +156,14 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
     this.callbackUrl = new URL("/oauth/callback", options.baseUrl).toString();
     this.staticSecret = options.staticSecret;
     this.onOuraTokens = options.onOuraTokens;
+    this.statePath = options.statePath ?? process.env.OAUTH_STATE_PATH;
+    this.loadState();
+    if (this.ouraTokens && this.onOuraTokens) {
+      this.onOuraTokens(
+        this.ouraTokens.accessToken,
+        this.ouraTokens.refreshToken
+      );
+    }
   }
 
   // ── Client Registration Store ──────────────────────────────
@@ -154,6 +189,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
           client_id_issued_at: Math.floor(Date.now() / 1000),
         };
         self.clients.set(clientId, client);
+        self.persistState();
         console.error(`OAuth client registered: ${clientId}`);
         return client;
       },
@@ -179,6 +215,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
       scopes: params.scopes || [],
       createdAt: Date.now(),
     });
+    this.persistState();
 
     // Redirect user to Oura's OAuth authorization page
     const ouraAuthUrl = new URL(OURA_AUTHORIZE_URL);
@@ -207,6 +244,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
     // Check expiry
     if (Date.now() - pending.createdAt > AUTH_CODE_TTL_MS) {
       this.pendingAuths.delete(ouraState);
+      this.persistState();
       throw new Error("Authorization request expired");
     }
 
@@ -214,6 +252,10 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
 
     // Exchange Oura's auth code for Oura tokens
     const ouraTokens = await this.exchangeOuraCode(ouraCode);
+    this.ouraTokens = {
+      accessToken: ouraTokens.access_token,
+      refreshToken: ouraTokens.refresh_token,
+    };
 
     // Notify the server to update the OuraClient with the new token
     if (this.onOuraTokens) {
@@ -229,6 +271,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
       scopes: pending.scopes,
       createdAt: Date.now(),
     });
+    this.persistState();
 
     // Build redirect URL back to the MCP client
     const redirectUrl = new URL(pending.redirectUri);
@@ -253,6 +296,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
 
     if (Date.now() - entry.createdAt > AUTH_CODE_TTL_MS) {
       this.authCodes.delete(authorizationCode);
+      this.persistState();
       throw new Error("Authorization code expired");
     }
 
@@ -275,6 +319,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
 
     if (Date.now() - entry.createdAt > AUTH_CODE_TTL_MS) {
       this.authCodes.delete(authorizationCode);
+      this.persistState();
       throw new Error("Authorization code expired");
     }
 
@@ -320,6 +365,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
 
     if (entry.expiresAt < Math.floor(Date.now() / 1000)) {
       this.accessTokens.delete(token);
+      this.persistState();
       throw new Error("Access token expired");
     }
 
@@ -339,6 +385,7 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
   ): Promise<void> {
     this.accessTokens.delete(request.token);
     this.refreshTokens.delete(request.token);
+    this.persistState();
   }
 
   // ── Private Helpers ────────────────────────────────────────
@@ -358,12 +405,62 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
       scopes,
     });
 
+    this.persistState();
+
     return {
       access_token: accessToken,
       token_type: "bearer",
       expires_in: ACCESS_TOKEN_TTL_S,
       refresh_token: refreshToken,
     };
+  }
+
+  private loadState(): void {
+    if (!this.statePath) return;
+
+    let raw: string;
+    try {
+      raw = readFileSync(this.statePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+
+    const state = JSON.parse(raw) as PersistedOAuthState;
+    if (state.version !== 1) {
+      throw new Error(`Unsupported OAuth state version: ${state.version}`);
+    }
+
+    this.clients = new Map(state.clients);
+    this.pendingAuths = new Map(state.pendingAuths);
+    this.authCodes = new Map(state.authCodes);
+    this.accessTokens = new Map(state.accessTokens);
+    this.refreshTokens = new Map(state.refreshTokens);
+    this.ouraTokens = state.ouraTokens;
+  }
+
+  private persistState(): void {
+    if (!this.statePath) return;
+
+    const directory = dirname(this.statePath);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+
+    const state: PersistedOAuthState = {
+      version: 1,
+      clients: [...this.clients],
+      pendingAuths: [...this.pendingAuths],
+      authCodes: [...this.authCodes],
+      accessTokens: [...this.accessTokens],
+      refreshTokens: [...this.refreshTokens],
+      ouraTokens: this.ouraTokens,
+    };
+    const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
+    writeFileSync(temporaryPath, JSON.stringify(state), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    renameSync(temporaryPath, this.statePath);
+    chmodSync(this.statePath, 0o600);
   }
 
   /**
