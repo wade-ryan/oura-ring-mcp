@@ -36,6 +36,7 @@ import type {
 } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import { InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type {
   OAuthClientInformationFull,
   OAuthTokens,
@@ -360,13 +361,13 @@ export class OuraMcpOAuthProvider implements OAuthServerProvider {
 
     const entry = this.accessTokens.get(token);
     if (!entry) {
-      throw new Error("Invalid access token");
+      throw new InvalidTokenError("Invalid access token");
     }
 
     if (entry.expiresAt < Math.floor(Date.now() / 1000)) {
       this.accessTokens.delete(token);
       this.persistState();
-      throw new Error("Access token expired");
+      throw new InvalidTokenError("Access token expired");
     }
 
     return {

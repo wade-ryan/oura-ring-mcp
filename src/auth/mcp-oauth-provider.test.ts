@@ -10,6 +10,7 @@ import {
   type OuraMcpOAuthProviderOptions,
 } from "./mcp-oauth-provider.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 
 // Suppress console.error from provider
 vi.spyOn(console, "error").mockImplementation(() => {});
@@ -420,7 +421,24 @@ describe("OuraMcpOAuthProvider", () => {
     it("should reject invalid token", async () => {
       await expect(
         provider.verifyAccessToken("bad-token")
-      ).rejects.toThrow("Invalid access token");
+      ).rejects.toBeInstanceOf(InvalidTokenError);
+    });
+
+    it("should reject expired token with the OAuth invalid-token error", async () => {
+      const client = registerTestClient(provider);
+      const code = await getAuthCodeViaOuraCallback(provider, client);
+      const tokens = await provider.exchangeAuthorizationCode(client, code);
+
+      vi.useFakeTimers();
+      vi.setSystemTime(Date.now() + 2 * 60 * 60 * 1000);
+
+      try {
+        await expect(
+          provider.verifyAccessToken(tokens.access_token)
+        ).rejects.toBeInstanceOf(InvalidTokenError);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("should accept static secret when configured", async () => {
